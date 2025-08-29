@@ -266,7 +266,9 @@ class BlenderNeRF_Operator(bpy.types.Operator):
                         v_idx = mesh.loops[loop_index].vertex_index
                         vert = mesh.vertices[v_idx]
 
-                        world_pos = matrix_world @ vert.co
+                        # Apply the same Blender→COLMAP axis flip as used for cameras
+                        world_pos = (ColmapExporter.blender_to_colmap_transform().to_3x3() @ (matrix_world @ vert.co))
+
                         if has_vcol:
                             cd = vcol_layer.data[loop_index].color
                             color = [int(cd[0] * 255), int(cd[1] * 255), int(cd[2] * 255)]
