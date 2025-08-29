@@ -3,6 +3,7 @@ import math
 import json
 import datetime
 import bpy
+from mathutils import Matrix
 
 
 # global addon script variables
@@ -78,7 +79,7 @@ class BlenderNeRF_Operator(bpy.types.Operator):
             'aabb_scale': scene.aabb
         }
 
-        return {'camera_angle_x': camera_angle_x} if scene.nerf else camera_intr_dict
+        return {'camera_angle_x': camera_angle_x} if scene.export_format == 'NERF' else camera_intr_dict
 
     # camera extrinsics (transform matrices)
     def get_camera_extrinsics(self, scene, camera, mode='TRAIN', method='SOF'):
@@ -114,8 +115,14 @@ class BlenderNeRF_Operator(bpy.types.Operator):
 
         return camera_extr_dict
 
-    # export vertex colors for each visible mesh
-    def save_splats_ply(self, scene, directory):
+    # export vertex colors for each visible mesh or COLMAP format
+    def save_splats_ply(self, scene, directory, method='SOF'):
+        if scene.export_format == 'COLMAP':
+            # Export in COLMAP format instead of PLY
+            self.save_colmap_format(scene, directory, method)
+            return
+            
+        # Original PLY export logic
         # create temporary vertex colors
         for obj in scene.objects:
             if obj.type == 'MESH':
@@ -155,6 +162,127 @@ class BlenderNeRF_Operator(bpy.types.Operator):
             obj.select_set(True)
 
         bpy.ops.object.mode_set(mode=init_mode)
+
+    def _get_method_camera(self, scene, method, mode):
+        """Get the appropriate camera for the given method and mode - FIX #2"""
+        try:
+            if method == 'COS':
+                if mode == 'TRAIN' and scene.train_data:
+                    # For COS training, use sphere camera if it exists
+                    if CAMERA_NAME in scene.objects:
+                        return scene.objects[CAMERA_NAME]
+                    else:
+                        self.report({'WARNING'}, f'{CAMERA_NAME} not found, using default camera')
+                        return scene.camera
+                else:
+                    # For COS testing, use main camera
+                    return scene.camera
+                    
+            elif method == 'TTC':
+                if mode == 'TRAIN':
+                    if scene.camera_train_target is None:
+                        self.report({'ERROR'}, 'Train camera not selected for TTC method')
+                        return None
+                    return scene.camera_train_target
+                elif mode == 'TEST':
+                    if scene.camera_test_target is None:
+                        self.report({'ERROR'}, 'Test camera not selected for TTC method')
+                        return None
+                    return scene.camera_test_target
+                else:
+                    return scene.camera
+                    
+            else:  # SOF or default
+                if scene.camera is None:
+                    self.report({'ERROR'}, 'No camera selected')
+                    return None
+                return scene.camera
+                
+        except (AttributeError, KeyError) as e:
+            self.report({'ERROR'}, f'Camera access error: {e}')
+            return None
+
+    def save_colmap_format(self, scene, directory, method='SOF'):
+        """Export COLMAP format using standalone exporter - method-aware"""
+        from .colmap_export import ColmapExporter
+        
+        # Create COLMAP subdirectory
+        colmap_dir = os.path.join(directory, 'sparse')
+        
+        # Get correct camera based on method - FIX #2: Method-aware camera selection
+        camera = self._get_method_camera(scene, method, 'TRAIN')
+        if camera is None:
+            self.report({'ERROR'}, f'Required camera not found for method {method}')
+            return
+            
+        camera_intrinsics = self.get_camera_intrinsics(scene, camera)
+        camera_extrinsics = self.get_camera_extrinsics(scene, camera, 'TRAIN', method)
+        
+        # Create COLMAP camera
+        colmap_camera = ColmapExporter.create_camera_from_blender(
+            camera_id=1, 
+            camera_intrinsics=camera_intrinsics,
+            camera_model='SIMPLE_PINHOLE'
+        )
+        cameras = [colmap_camera]
+        
+        # Create COLMAP images with coordinate transformation
+        transform_matrix = ColmapExporter.blender_to_colmap_transform()
+        images = []
+        
+        for i, frame_data in enumerate(camera_extrinsics):
+            colmap_image = ColmapExporter.create_image_from_blender(
+                image_id=i + 1,
+                camera_id=1,
+                frame_data=frame_data,
+                transform_matrix=transform_matrix
+            )
+            images.append(colmap_image)
+        
+        # Create COLMAP points from mesh vertices
+        points = []
+        point_id = 1
+        
+        for obj in scene.objects:
+            if obj.type == 'MESH' and self.is_object_visible(obj):
+                mesh = obj.data
+                matrix_world = obj.matrix_world
+                
+                # Get vertex colors if available
+                has_vertex_colors = mesh.vertex_colors and len(mesh.vertex_colors) > 0
+                
+                for poly in mesh.polygons:
+                    for loop_index in poly.loop_indices:
+                        vertex_index = mesh.loops[loop_index].vertex_index
+                        vertex = mesh.vertices[vertex_index]
+                        
+                        # Transform vertex to world coordinates
+                        world_pos = matrix_world @ vertex.co
+                        
+                        # Get vertex color
+                        if has_vertex_colors:
+                            color_data = mesh.vertex_colors[0].data[loop_index]
+                            color = [
+                                int(color_data.color[0] * 255),
+                                int(color_data.color[1] * 255),
+                                int(color_data.color[2] * 255)
+                            ]
+                        else:
+                            color = [128, 128, 128]  # Default gray color
+                        
+                        colmap_point = ColmapExporter.create_point3d_from_vertex(
+                            point_id=point_id,
+                            world_pos=world_pos,
+                            color=color
+                        )
+                        points.append(colmap_point)
+                        point_id += 1
+        
+        # Write COLMAP model
+        binary = scene.colmap_binary
+        ColmapExporter.write_colmap_model(colmap_dir, cameras, images, points, binary)
+        
+        self.report({'INFO'}, f'COLMAP format exported to {colmap_dir}')
 
     def save_json(self, directory, filename, data, indent=4):
         filepath = os.path.join(directory, filename)
@@ -213,7 +341,7 @@ class BlenderNeRF_Operator(bpy.types.Operator):
         if method == 'COS' and any(x == 0 for x in scene.sphere_scale):
             error_messages.append('The BlenderNeRF Sphere cannot be flat! Change its scale to be non zero in all axes.')
 
-        if not scene.nerf and not self.is_power_of_two(scene.aabb):
+        if scene.export_format != 'NERF' and not self.is_power_of_two(scene.aabb):
             error_messages.append('AABB scale needs to be a power of two!')
 
         if scene.save_path == '':
@@ -238,7 +366,7 @@ class BlenderNeRF_Operator(bpy.types.Operator):
             'Test': scene.test_data,
             'AABB': scene.aabb,
             'Render Frames': scene.render_frames,
-            'File Format': 'NeRF' if scene.nerf else 'NGP',
+            'File Format': scene.export_format,
             'Save Path': scene.save_path,
             'Method': method
         }
