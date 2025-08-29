@@ -1,7 +1,8 @@
 import os
 import struct
 import collections
-from mathutils import Matrix, Quaternion
+from mathutils import Matrix
+import math
 
 
 # COLMAP data structures (standalone, no external dependencies)
@@ -138,15 +139,8 @@ class ColmapExporter:
     
     @staticmethod
     def blender_to_colmap_transform():
-        """Get transformation matrix from Blender to COLMAP coordinate system"""
-        # Blender: +X right, +Y up, -Z forward
-        # COLMAP: +X right, -Y down, +Z forward
-        return Matrix((
-            (1, 0, 0, 0),
-            (0, -1, 0, 0),
-            (0, 0, -1, 0),
-            (0, 0, 0, 1)
-        ))
+        """Rotate 180° around +X: (+X, +Y, -Z) -> (+X, -Y, +Z). Proper rotation (det=+1)."""
+        return Matrix.Rotation(math.pi, 4, 'X')
     
     @staticmethod
     def create_camera_from_blender(camera_id, camera_intrinsics, camera_model='SIMPLE_PINHOLE'):
@@ -182,29 +176,40 @@ class ColmapExporter:
     
     @staticmethod
     def create_image_from_blender(image_id, camera_id, frame_data, transform_matrix):
-        """Create COLMAP image from BlenderNeRF frame data"""
-        # Transform camera matrix to COLMAP coordinate system
-        blender_matrix = Matrix(frame_data['transform_matrix'])
-        colmap_matrix = transform_matrix @ blender_matrix
-        
-        # Convert to quaternion and translation
-        loc, rot, scale = colmap_matrix.decompose()
-        quat = rot.normalized()
-        
-        # Extract filename
+        """Create COLMAP image (W2C quaternion + t) from Blender frame."""
+        # Camera-to-World in Blender coords
+        blender_c2w = Matrix(frame_data['transform_matrix'])
+        R_bl = blender_c2w.to_3x3()                # C2W rotation (Blender world basis)
+        C_bl = blender_c2w.to_translation()        # camera center in Blender world
+
+        # Convert Blender world -> COLMAP world with S (proper rotation)
+        S = transform_matrix                        # 180° about X
+        S3 = S.to_3x3()
+        R_c2w_col = S3 @ R_bl @ S3                  # same as S * R * S^T because S is orthonormal & S^T==S
+        C_col     = S3 @ C_bl
+
+        # World-to-Camera
+        R_w2c = R_c2w_col.transposed()
+        t_col = -(R_w2c @ C_col)
+
+        # Quaternion (qw, qx, qy, qz) from R_w2c
+        q = R_w2c.to_quaternion().normalized()
+
+        # Image name
         image_name = os.path.basename(frame_data['file_path'])
-        if not image_name.endswith(('.png', '.jpg', '.jpeg')):
+        if not image_name.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.exr')):
             image_name += '.png'
-        
+
         return Image(
             id=image_id,
-            qvec=[quat.w, quat.x, quat.y, quat.z],  # Hamilton convention
-            tvec=[loc.x, loc.y, loc.z],
+            qvec=[q.w, q.x, q.y, q.z],          # COLMAP order: (qw, qx, qy, qz)
+            tvec=[t_col.x, t_col.y, t_col.z],   # COLMAP t = -R*C  (NOT the camera center)
             camera_id=camera_id,
             name=image_name,
-            xys=[],  # Empty for synthetic data
-            point3D_ids=[]  # Empty for synthetic data
+            xys=[],
+            point3D_ids=[]
         )
+
     
     @staticmethod
     def create_point3d_from_vertex(point_id, world_pos, color):
