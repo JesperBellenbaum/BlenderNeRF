@@ -44,8 +44,10 @@ class BlenderNeRF_UI(bpy.types.Panel):
             layout.label(text='File Format')
 
             row = layout.row(align=True)
-            row.prop(scene, 'nerf', toggle=True, text='NGP', invert_checkbox=True)
-            row.prop(scene, 'nerf', toggle=True)
+            row.prop(scene, 'export_format', expand=True)
+            
+            if scene.export_format == 'COLMAP':
+                layout.prop(scene, 'colmap_binary', text='Binary Format (.bin)')
 
             layout.separator()
             layout.use_property_split = True

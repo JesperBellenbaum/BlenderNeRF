@@ -3,6 +3,7 @@ import math
 import json
 import datetime
 import bpy
+from mathutils import Matrix
 
 
 # global addon script variables
@@ -17,68 +18,47 @@ class BlenderNeRF_Operator(bpy.types.Operator):
 
     # camera intrinsics
     def get_camera_intrinsics(self, scene, camera):
-        camera_angle_x = camera.data.angle_x
-        camera_angle_y = camera.data.angle_y
+        import math
+        cam = camera.data
 
-        # camera properties
-        f_in_mm = camera.data.lens # focal length in mm
-        scale = scene.render.resolution_percentage / 100
-        width_res_in_px = scene.render.resolution_x * scale # width
-        height_res_in_px = scene.render.resolution_y * scale # height
-        optical_center_x = width_res_in_px / 2
-        optical_center_y = height_res_in_px / 2
+        # Final render size
+        scale = scene.render.resolution_percentage / 100.0
+        width  = int(round(scene.render.resolution_x * scale))
+        height = int(round(scene.render.resolution_y * scale))
 
-        # pixel aspect ratios
-        size_x = scene.render.pixel_aspect_x * width_res_in_px
-        size_y = scene.render.pixel_aspect_y * height_res_in_px
-        pixel_aspect_ratio = scene.render.pixel_aspect_x / scene.render.pixel_aspect_y
+        # Pixel aspect (usually 1.0 / 1.0)
+        pax = float(scene.render.pixel_aspect_x)
+        pay = float(scene.render.pixel_aspect_y)
 
-        # sensor fit and sensor size (and camera angle swap in specific cases)
-        if camera.data.sensor_fit == 'AUTO':
-            sensor_size_in_mm = camera.data.sensor_height if width_res_in_px < height_res_in_px else camera.data.sensor_width
-            if width_res_in_px < height_res_in_px:
-                sensor_fit = 'VERTICAL'
-                camera_angle_x, camera_angle_y = camera_angle_y, camera_angle_x
-            elif width_res_in_px > height_res_in_px:
-                sensor_fit = 'HORIZONTAL'
-            else:
-                sensor_fit = 'VERTICAL' if size_x <= size_y else 'HORIZONTAL'
+        # Blender’s FOVs already incorporate lens, sensor size, and sensor_fit.
+        ax = cam.angle_x
+        ay = cam.angle_y
 
-        else:
-            sensor_fit = camera.data.sensor_fit
-            if sensor_fit == 'VERTICAL':
-                sensor_size_in_mm = camera.data.sensor_height if width_res_in_px <= height_res_in_px else camera.data.sensor_width
-                if width_res_in_px <= height_res_in_px:
-                    camera_angle_x, camera_angle_y = camera_angle_y, camera_angle_x
+        # Focal in "pixel units" — account for non-square pixels
+        # Wider pixels (pax>1) mean fewer horizontal pixels per same angle -> divide width by pax.
+        fx = 0.5 * (width  / pax) / math.tan(0.5 * ax)
+        fy = 0.5 * (height / pay) / math.tan(0.5 * ay)
 
-        # focal length for horizontal sensor fit
-        if sensor_fit == 'HORIZONTAL':
-            sensor_size_in_mm = camera.data.sensor_width
-            s_u = f_in_mm / sensor_size_in_mm * width_res_in_px
-            s_v = f_in_mm / sensor_size_in_mm * width_res_in_px * pixel_aspect_ratio
+        # Principal point with lens shift (Blender shift is in NDC-ish units of focal lengths)
+        # Positive shift_x moves the image right -> principal point moves left.
+        cx = 0.5 * width  - cam.shift_x * fx
+        # Positive shift_y moves the image up -> principal point moves down.
+        cy = 0.5 * height + cam.shift_y * fy
 
-        # focal length for vertical sensor fit
-        if sensor_fit == 'VERTICAL':
-            s_u = f_in_mm / sensor_size_in_mm * width_res_in_px / pixel_aspect_ratio
-            s_v = f_in_mm / sensor_size_in_mm * width_res_in_px
-
-        camera_intr_dict = {
-            'camera_angle_x': camera_angle_x,
-            'camera_angle_y': camera_angle_y,
-            'fl_x': s_u,
-            'fl_y': s_v,
-            'k1': 0.0,
-            'k2': 0.0,
-            'p1': 0.0,
-            'p2': 0.0,
-            'cx': optical_center_x,
-            'cy': optical_center_y,
-            'w': width_res_in_px,
-            'h': height_res_in_px,
-            'aabb_scale': scene.aabb
+        intr = {
+            'camera_angle_x': ax,
+            'camera_angle_y': ay,
+            'fl_x': fx,
+            'fl_y': fy,
+            'k1': 0.0, 'k2': 0.0, 'p1': 0.0, 'p2': 0.0,
+            'cx': cx, 'cy': cy,
+            'w': width, 'h': height,
+            'aabb_scale': scene.aabb,
         }
 
-        return {'camera_angle_x': camera_angle_x} if scene.nerf else camera_intr_dict
+        # Keep your minimal NERF payload behavior.
+        return {'camera_angle_x': ax} if scene.export_format == 'NERF' else intr
+
 
     # camera extrinsics (transform matrices)
     def get_camera_extrinsics(self, scene, camera, mode='TRAIN', method='SOF'):
@@ -114,8 +94,14 @@ class BlenderNeRF_Operator(bpy.types.Operator):
 
         return camera_extr_dict
 
-    # export vertex colors for each visible mesh
-    def save_splats_ply(self, scene, directory):
+    # export vertex colors for each visible mesh or COLMAP format
+    def save_splats_ply(self, scene, directory, method='SOF'):
+        if scene.export_format == 'COLMAP':
+            # Export in COLMAP format instead of PLY
+            self.save_colmap_format(scene, directory, method)
+            return
+            
+        # Original PLY export logic
         # create temporary vertex colors
         for obj in scene.objects:
             if obj.type == 'MESH':
@@ -155,6 +141,161 @@ class BlenderNeRF_Operator(bpy.types.Operator):
             obj.select_set(True)
 
         bpy.ops.object.mode_set(mode=init_mode)
+
+    def _get_method_camera(self, scene, method, mode):
+        """Get the appropriate camera for the given method and mode - FIX #2"""
+        try:
+            if method == 'COS':
+                if mode == 'TRAIN' and scene.train_data:
+                    # For COS training, use sphere camera if it exists
+                    if CAMERA_NAME in scene.objects:
+                        return scene.objects[CAMERA_NAME]
+                    else:
+                        self.report({'WARNING'}, f'{CAMERA_NAME} not found, using default camera')
+                        return scene.camera
+                else:
+                    # For COS testing, use main camera
+                    return scene.camera
+                    
+            elif method == 'TTC':
+                if mode == 'TRAIN':
+                    if scene.camera_train_target is None:
+                        self.report({'ERROR'}, 'Train camera not selected for TTC method')
+                        return None
+                    return scene.camera_train_target
+                elif mode == 'TEST':
+                    if scene.camera_test_target is None:
+                        self.report({'ERROR'}, 'Test camera not selected for TTC method')
+                        return None
+                    return scene.camera_test_target
+                else:
+                    return scene.camera
+                    
+            else:  # SOF or default
+                if scene.camera is None:
+                    self.report({'ERROR'}, 'No camera selected')
+                    return None
+                return scene.camera
+                
+        except (AttributeError, KeyError) as e:
+            self.report({'ERROR'}, f'Camera access error: {e}')
+            return None
+
+    def save_colmap_format(self, scene, directory, method='SOF'):
+        """Export COLMAP format using standalone exporter (method-aware, robust intrinsics/poses)."""
+        import os
+        from .colmap_export import ColmapExporter
+
+        # --- paths ----------------------------------------------------------------
+        colmap_dir = os.path.join(directory, 'sparse', '0')
+        os.makedirs(colmap_dir, exist_ok=True)
+
+        # --- camera selection ------------------------------------------------------
+        camera = self._get_method_camera(scene, method, 'TRAIN')
+        if camera is None:
+            self.report({'ERROR'}, f'Required camera not found for method {method}')
+            return
+
+        # --- intrinsics & extrinsics ----------------------------------------------
+        camera_intrinsics = self.get_camera_intrinsics(scene, camera)
+        camera_extrinsics = self.get_camera_extrinsics(scene, camera, 'TRAIN', method)
+        if not camera_extrinsics:
+            self.report({'ERROR'}, 'No frames to export (check frame range / step).')
+            return
+
+        # Choose model automatically: PINHOLE if fx != fy
+        fx = float(camera_intrinsics['fl_x'])
+        fy = float(camera_intrinsics['fl_y'])
+        camera_model_name = 'SIMPLE_PINHOLE' if abs(fx - fy) < 1e-9 else 'PINHOLE'
+
+        # Build COLMAP camera
+        colmap_camera = ColmapExporter.create_camera_from_blender(
+            camera_id=1,
+            camera_intrinsics=camera_intrinsics,
+            camera_model=camera_model_name
+        )
+        cameras = [colmap_camera]
+
+        # --- filenames/extensions --------------------------------------------------
+        # Blender’s actual render extension (uppercase in UI); enforce PNG for splats.
+        ext = scene.render.image_settings.file_format.lower()
+        if scene.splats:
+            ext = 'png'  # Gaussian Splatting requires PNG in your pipeline
+
+        def ensure_ext(name: str) -> str:
+            n = name
+            # If the path came without extension (common in your get_camera_extrinsics with splats),
+            # add the correct extension. Otherwise, normalize it.
+            if not n.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.exr')):
+                n = f"{n}.{ext}"
+            else:
+                # normalize extension to what we actually write on disk
+                base, _old = os.path.splitext(n)
+                n = f"{base}.{ext}"
+            return n
+
+        # --- pose conversion (uses fixed ColmapExporter.create_image_from_blender) --
+        S = ColmapExporter.blender_to_colmap_transform()
+        images = []
+        for i, frame_data in enumerate(camera_extrinsics):
+            # Normalize filename to real file on disk
+            frame_data = dict(frame_data)  # shallow copy
+            frame_data['file_path'] = ensure_ext(frame_data['file_path'])
+
+            img = ColmapExporter.create_image_from_blender(
+                image_id=i + 1,
+                camera_id=1,
+                frame_data=frame_data,
+                transform_matrix=S
+            )
+            images.append(img)
+
+        # --- points from visible meshes -------------------------------------------
+        points = []
+        point_id = 1
+        for obj in scene.objects:
+            if obj.type == 'MESH' and self.is_object_visible(obj):
+                mesh = obj.data
+                matrix_world = obj.matrix_world
+
+                has_vcol = mesh.vertex_colors and len(mesh.vertex_colors) > 0
+                vcol_layer = mesh.vertex_colors[0] if has_vcol else None
+
+                for poly in mesh.polygons:
+                    for loop_index in poly.loop_indices:
+                        v_idx = mesh.loops[loop_index].vertex_index
+                        vert = mesh.vertices[v_idx]
+
+                        # Apply the same Blender→COLMAP axis flip as used for cameras
+                        world_pos = (ColmapExporter.blender_to_colmap_transform().to_3x3() @ (matrix_world @ vert.co))
+
+                        if has_vcol:
+                            cd = vcol_layer.data[loop_index].color
+                            color = [int(cd[0] * 255), int(cd[1] * 255), int(cd[2] * 255)]
+                        else:
+                            color = [128, 128, 128]
+
+                        p = ColmapExporter.create_point3d_from_vertex(
+                            point_id=point_id,
+                            world_pos=world_pos,
+                            color=color
+                        )
+                        points.append(p)
+                        point_id += 1
+
+        # --- write model -----------------------------------------------------------
+        binary = scene.colmap_binary
+        ColmapExporter.write_colmap_model(colmap_dir, cameras, images, points, binary)
+
+        # --- validations & report --------------------------------------------------
+        # 1) Make sure images.txt names match your files. We only check names here;
+        #    existence check would require disk access to your render path, which may vary.
+        n_imgs = len(images)
+        n_pts = len(points)
+        cam_model = cameras[0].model
+        res = f"{cameras[0].width}x{cameras[0].height}"
+        self.report({'INFO'}, f'COLMAP exported to {colmap_dir} | {n_imgs} images, {n_pts} pts | {cam_model} @ {res}')
+
 
     def save_json(self, directory, filename, data, indent=4):
         filepath = os.path.join(directory, filename)
@@ -213,7 +354,7 @@ class BlenderNeRF_Operator(bpy.types.Operator):
         if method == 'COS' and any(x == 0 for x in scene.sphere_scale):
             error_messages.append('The BlenderNeRF Sphere cannot be flat! Change its scale to be non zero in all axes.')
 
-        if not scene.nerf and not self.is_power_of_two(scene.aabb):
+        if scene.export_format != 'NERF' and not self.is_power_of_two(scene.aabb):
             error_messages.append('AABB scale needs to be a power of two!')
 
         if scene.save_path == '':
@@ -238,7 +379,7 @@ class BlenderNeRF_Operator(bpy.types.Operator):
             'Test': scene.test_data,
             'AABB': scene.aabb,
             'Render Frames': scene.render_frames,
-            'File Format': 'NeRF' if scene.nerf else 'NGP',
+            'File Format': scene.export_format,
             'Save Path': scene.save_path,
             'Method': method
         }

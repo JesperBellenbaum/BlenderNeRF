@@ -14,10 +14,19 @@ class SubsetOfFrames(blender_nerf_operator.BlenderNeRF_Operator):
         scene = context.scene
         camera = scene.camera
 
-        # check if camera is selected : next errors depend on an existing camera
-        if camera == None:
-            self.report({'ERROR'}, 'Be sure to have a selected camera!')
-            return {'FINISHED'}
+        
+        if camera is None:
+            self.report({'ERROR'}, 'No camera selected! Please select a camera for SOF method.')
+            return {'CANCELLED'}
+        
+        # Validate camera object
+        try:
+            if not hasattr(camera, 'data'):
+                self.report({'ERROR'}, 'Selected object is not a valid camera!')
+                return {'CANCELLED'}
+        except AttributeError:
+            self.report({'ERROR'}, 'Camera validation failed!')
+            return {'CANCELLED'}
 
         # if there is an error, print first error message
         error_messages = self.asserts(scene, method='SOF')
@@ -33,30 +42,47 @@ class SubsetOfFrames(blender_nerf_operator.BlenderNeRF_Operator):
         os.makedirs(output_path, exist_ok=True)
 
         if scene.logs: self.save_log_file(scene, output_path, method='SOF')
-        if scene.splats: self.save_splats_ply(scene, output_path)
+        
+        # For COLMAP: generate metadata files but let rendering happen normally
+        if scene.export_format == 'COLMAP':
+            # Generate COLMAP files (cameras, images, points3D)
+            self.save_colmap_format(scene, output_path, method='SOF')
+        else:
+            # Traditional NeRF/NGP export
+            if scene.splats: self.save_splats_ply(scene, output_path, method='SOF')
+
+        # Generate JSON transforms for traditional formats
+        if scene.export_format != 'COLMAP':
+            if scene.test_data:
+                # testing transforms
+                output_data['frames'] = self.get_camera_extrinsics(scene, camera, mode='TEST', method='SOF')
+                self.save_json(output_path, 'transforms_test.json', output_data)
+
+            if scene.train_data:
+                # training transforms
+                output_data['frames'] = self.get_camera_extrinsics(scene, camera, mode='TRAIN', method='SOF')
+                self.save_json(output_path, 'transforms_train.json', output_data)
 
         # initial properties might have changed since set_init_props update
         scene.init_frame_step = scene.frame_step
         scene.init_output_path = scene.render.filepath
 
-        if scene.test_data:
-            # testing transforms
-            output_data['frames'] = self.get_camera_extrinsics(scene, camera, mode='TEST', method='SOF')
-            self.save_json(output_path, 'transforms_test.json', output_data)
-
-        if scene.train_data:
-            # training transforms
-            output_data['frames'] = self.get_camera_extrinsics(scene, camera, mode='TRAIN', method='SOF')
-            self.save_json(output_path, 'transforms_train.json', output_data)
-
-            # rendering
-            if scene.render_frames:
+        # Handle rendering (for both COLMAP and traditional formats)
+        if scene.train_data and scene.render_frames:
+            if scene.export_format == 'COLMAP':
+                # For COLMAP: render images to images/ folder (COLMAP standard)
+                output_images = os.path.join(output_path, 'images')
+                os.makedirs(output_images, exist_ok=True)
+                scene.render.filepath = os.path.join(output_images, '')
+            else:
+                # For traditional: render images to train/ folder
                 output_train = os.path.join(output_path, 'train')
                 os.makedirs(output_train, exist_ok=True)
-                scene.rendering = (True, False, False)
-                scene.frame_step = scene.train_frame_steps # update frame step
-                scene.render.filepath = os.path.join(output_train, '') # training frames path
-                bpy.ops.render.render('INVOKE_DEFAULT', animation=True, write_still=True) # render scene
+                scene.render.filepath = os.path.join(output_train, '')
+            
+            scene.rendering = (True, False, False)
+            scene.frame_step = scene.train_frame_steps # update frame step
+            bpy.ops.render.render('INVOKE_DEFAULT', animation=True, write_still=True) # render scene
 
         # if frames are rendered, the below code is executed by the handler function
         if not any(scene.rendering):
